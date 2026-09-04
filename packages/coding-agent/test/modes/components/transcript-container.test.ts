@@ -501,6 +501,29 @@ describe("TranscriptContainer", () => {
 		expect(transcript.renderTail(80, 0)).toEqual([]);
 	});
 
+	it("pages a frozen transcript snapshot backward without losing separators", () => {
+		const transcript = new TranscriptContainer();
+		const first = new Block(["a1", "a2"], true);
+		transcript.addChild(first);
+		transcript.addChild(new Block([], true));
+		transcript.addChild(new Block(["b1"], true));
+		const tail = new Block(["c1", "c2"], false);
+		transcript.addChild(tail);
+		const expected = [...transcript.render(80)];
+		const snapshot = transcript.createScrollSnapshot(80);
+		let page = transcript.renderScrollPage(snapshot, undefined, 3);
+		let paged = [...page.rows];
+		tail.finalize(["changed"]);
+		transcript.removeChild(first);
+
+		while (page.cursor !== undefined) {
+			page = transcript.renderScrollPage(snapshot, page.cursor, 3);
+			paged = [...page.rows, ...paged];
+		}
+
+		expect(paged).toEqual(expected);
+	});
+
 	it("cancels a pending replay so shutdown flush emits only un-retired rows", () => {
 		const transcript = new TranscriptContainer();
 		transcript.addChild(new Block(["committed"], true));

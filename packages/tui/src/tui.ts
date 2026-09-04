@@ -17,8 +17,9 @@ import { performance } from "node:perf_hooks";
 import { $flag, getDebugLogPath, logger, postmortem } from "@oh-my-pi/pi-utils";
 import { DEFAULT_MAX_INLINE_IMAGES, ImageBudget } from "./components/image";
 import { TuiDebugServer } from "./debug-server";
-import { isKeyRelease, matchesKey } from "./keys";
+import { isKeyRelease, isKeyReleaseSequence, matchesKey } from "./keys";
 import { LoopWatchdog } from "./loop-watchdog";
+import { parseSgrMouse } from "./mouse";
 import { STDOUT_BACKLOG_CLEAR_BYTES, setAltScreenActive, type Terminal } from "./terminal";
 import {
 	encodeKittyDeleteAllImages,
@@ -87,9 +88,14 @@ const PAINT_END_NO_SYNC = ENABLE_AUTOWRAP;
 // native text selection.
 const MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h";
 const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1000l";
+const NORMAL_MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1006h";
+const NORMAL_MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1000l";
 
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
+interface InputListenerOptions {
+	readonly resetViewportOnConsume?: boolean;
+}
 type StartListener = () => void;
 
 export interface RenderTimer {
@@ -104,6 +110,12 @@ export interface RenderScheduler {
 
 export interface TUIOptions {
 	renderScheduler?: RenderScheduler;
+	/**
+	 * Enable terminal mouse reporting (?1000h/?1006h) in normal mode.
+	 * Defaults to false. When enabled, button press/release events (including
+	 * Option-click) are reported without any-motion flooding.
+	 */
+	mouseTracking?: boolean;
 }
 /** Physical terminal dimensions supplied to a frame provider. */
 export interface ViewportSize {
@@ -138,8 +150,12 @@ export interface TerminalFrameProvider {
 	renderResizeFrame?(viewport: ViewportSize): readonly string[];
 	/** Re-offer finalized history after a display reset or resize replay. */
 	beginHistoryReplay?(): void;
-	/** Force every currently eligible finalized prefix to retire before stop. */
+	/** Flush all finalized history batches before TUI shutdown. */
 	beginHistoryFlush?(): void;
+	/** Called after the mutable viewport has been written to the terminal with its authoritative screen top. */
+	onFrameEmitted?(viewportTop: number): void;
+	scrollViewport?(delta: -1 | 1): boolean;
+	resetViewport?(): boolean;
 }
 
 export interface TUIStartOptions {
@@ -721,7 +737,7 @@ export class TUI extends Container {
 		  }
 		| undefined;
 	#debugNextWindowTop = 0;
-	#inputListeners = new Set<InputListener>();
+	#inputListeners = new Map<InputListener, InputListenerOptions>();
 	#startListeners = new Set<StartListener>();
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
@@ -816,6 +832,8 @@ export class TUI extends Container {
 	// normal screen. #altPreviousLines is the last alt frame, for repaint-skip.
 	#altActive = false;
 	#altMouseTrackingActive = false;
+	#normalMouseTrackingActive = false;
+	#mouseTracking: boolean;
 	#altPreviousLines: string[] = [];
 	#altEnterWidth = 0;
 	#altEnterHeight = 0;
@@ -842,6 +860,7 @@ export class TUI extends Container {
 		this.#renderScheduler = options?.renderScheduler ?? DEFAULT_RENDER_SCHEDULER;
 		this.#showHardwareCursor = showHardwareCursor === undefined ? this.#showHardwareCursor : showHardwareCursor;
 		this.#watchdog = new LoopWatchdog();
+		this.#mouseTracking = options?.mouseTracking ?? false;
 	}
 	static #initialResizeScrollbackMode(): ResizeScrollbackMode {
 		const mode = Bun.env.PI_TUI_RESIZE_SCROLLBACK;
@@ -882,6 +901,35 @@ export class TUI extends Container {
 	/** Return how settled resizes refresh native scrollback. */
 	getResizeScrollback(): ResizeScrollbackMode {
 		return this.#resizeScrollbackMode;
+	}
+
+	get mouseTracking(): boolean {
+		return this.#mouseTracking;
+	}
+
+	setMouseTracking(enabled: boolean): void {
+		if (this.#mouseTracking === enabled) return;
+		this.#mouseTracking = enabled;
+		if (!enabled && this.#frameProvider?.resetViewport?.()) this.requestRender();
+		if (this.#stopped || this.#inputDeferred || this.#altActive) return;
+		this.terminal.write(enabled ? NORMAL_MOUSE_TRACKING_ON : NORMAL_MOUSE_TRACKING_OFF);
+		this.#normalMouseTrackingActive = enabled;
+	}
+
+	get resizeAltActive(): boolean {
+		return this.#resizeAltActive;
+	}
+
+	get clearScrollbackOnNextRender(): boolean {
+		return this.#clearScrollbackOnNextRender;
+	}
+
+	get providerViewportTop(): number {
+		return this.#providerViewportTop;
+	}
+
+	get hardwareCursorRow(): number {
+		return this.#hardwareCursorRow;
 	}
 
 	/** Set how settled resizes refresh native scrollback. */
@@ -1150,6 +1198,10 @@ export class TUI extends Container {
 		}
 		this.terminal.hideCursor();
 		this.#recordHardwareCursorHidden();
+		if (this.#mouseTracking && !this.#altActive && !this.#inputDeferred) {
+			this.terminal.write(NORMAL_MOUSE_TRACKING_ON);
+			this.#normalMouseTrackingActive = true;
+		}
 		if (!this.#inputDeferred) {
 			this.#querySixelSupport();
 			this.#queryCellSize();
@@ -1459,6 +1511,10 @@ export class TUI extends Container {
 		if (!this.#inputDeferred || this.#stopped) return;
 		this.#inputDeferred = false;
 		this.terminal.enableInput?.();
+		if (this.#mouseTracking && !this.#altActive && !this.#normalMouseTrackingActive) {
+			this.terminal.write(NORMAL_MOUSE_TRACKING_ON);
+			this.#normalMouseTrackingActive = true;
+		}
 		this.#querySixelSupport();
 		this.#queryCellSize();
 	}
@@ -1470,8 +1526,8 @@ export class TUI extends Container {
 		};
 	}
 
-	addInputListener(listener: InputListener): () => void {
-		this.#inputListeners.add(listener);
+	addInputListener(listener: InputListener, options: InputListenerOptions = {}): () => void {
+		this.#inputListeners.set(listener, options);
 		return () => {
 			this.#inputListeners.delete(listener);
 		};
@@ -1491,7 +1547,9 @@ export class TUI extends Container {
 
 		this.#clearSixelProbeState();
 		this.#sixelProbePendingGraphics = true;
-		this.#sixelProbeUnsubscribe = this.addInputListener(data => this.#handleSixelProbeInput(data));
+		this.#sixelProbeUnsubscribe = this.addInputListener(data => this.#handleSixelProbeInput(data), {
+			resetViewportOnConsume: false,
+		});
 		// XTSMGRAPHICS item 2 reports the terminal's maximum SIXEL geometry. DA1
 		// attribute 4 advertises SIXEL as well, but ProcessTerminal swallows every
 		// `CSI ? … c` reply for the whole session so a late one cannot leak into the
@@ -1655,6 +1713,10 @@ export class TUI extends Container {
 			this.#altMouseTrackingActive = false;
 			this.#altPreviousLines = [];
 			this.#pendingAltExit = "";
+		}
+		if (this.#normalMouseTrackingActive) {
+			this.terminal.write(NORMAL_MOUSE_TRACKING_OFF);
+			this.#normalMouseTrackingActive = false;
 		}
 		// A latched destructive reset (settled rebuild-mode resize, /clear) pairs
 		// ED3 with a complete-ledger replay. Running that pair during stop would
@@ -1912,21 +1974,48 @@ export class TUI extends Container {
 		if (matchesKey(data, "ctrl+c") || matchesKey(data, "escape")) {
 			this.#inputRenderGraceUntilMs = this.#renderScheduler.now() + TUI.#INPUT_RENDER_GRACE_MS;
 		}
+		const viewportProvider =
+			this.#mouseTracking && !this.#altActive && this.#getTopmostVisibleOverlay() === undefined
+				? this.#frameProvider
+				: undefined;
 		if (this.#inputListeners.size > 0) {
 			let current = data;
-			for (const listener of this.#inputListeners) {
+			let resetViewportOnEmpty = false;
+			for (const [listener, options] of this.#inputListeners) {
+				const currentMouseEvent = current.startsWith("\x1b[<") ? parseSgrMouse(current) : undefined;
+				const shouldResetCurrent =
+					!isKeyReleaseSequence(current) &&
+					(currentMouseEvent == null || (currentMouseEvent.leftClick && !currentMouseEvent.release));
 				const result = listener(current);
 				if (result?.consume) {
+					if (
+						shouldResetCurrent &&
+						options.resetViewportOnConsume !== false &&
+						viewportProvider?.resetViewport?.()
+					) {
+						this.requestRender();
+					}
 					return;
 				}
 				if (result?.data !== undefined) {
+					resetViewportOnEmpty =
+						result.data.length === 0 && shouldResetCurrent && options.resetViewportOnConsume !== false;
 					current = result.data;
 				}
 			}
 			if (current.length === 0) {
+				if (resetViewportOnEmpty && viewportProvider?.resetViewport?.()) this.requestRender();
 				return;
 			}
 			data = current;
+		}
+		const mouseEvent = data.startsWith("\x1b[<") ? parseSgrMouse(data) : undefined;
+		const keyRelease = isKeyRelease(data);
+		const shouldResetViewport =
+			!isKeyReleaseSequence(data) && (mouseEvent == null || (mouseEvent.leftClick && !mouseEvent.release));
+		if (mouseEvent && mouseEvent.wheel !== null && viewportProvider?.scrollViewport?.(mouseEvent.wheel)) {
+			this.requestRender();
+			return;
 		}
 
 		// Consume terminal cell size responses without blocking unrelated input.
@@ -1936,6 +2025,7 @@ export class TUI extends Container {
 
 		// Global debug key handler (Shift+Ctrl+D)
 		if (matchesKey(data, "shift+ctrl+d") && this.onDebug) {
+			if (shouldResetViewport && viewportProvider?.resetViewport?.()) this.requestRender();
 			this.onDebug();
 			return;
 		}
@@ -1962,10 +2052,12 @@ export class TUI extends Container {
 		const focused = this.#focusedComponent;
 		if (focused?.handleInput) {
 			// Filter out key release events unless component opts in
-			if (isKeyRelease(data) && !focused.wantsKeyRelease) {
+			if (keyRelease && !focused.wantsKeyRelease) {
 				return;
 			}
+			if (shouldResetViewport && mouseEvent == null) viewportProvider?.resetViewport?.();
 			focused.handleInput(data);
+			if (shouldResetViewport && mouseEvent != null) viewportProvider?.resetViewport?.();
 			this.requestRender();
 		}
 	}
@@ -2401,8 +2493,11 @@ export class TUI extends Container {
 		if (offered !== undefined && offered.id <= this.#acceptedHistoryBatchId) provider?.acknowledgeHistory(offered.id);
 
 		let historyRows = history?.rows ?? [];
+		let providerViewportInset = 0;
 		let replayViewportRows = 0;
 		if (history?.kind === "replay") {
+			const viewportPaddingRows = Math.max(0, height - viewport.length);
+			providerViewportInset = viewportPaddingRows;
 			// Providers may omit unused leading rows from a short viewport. Make
 			// that logical space explicit before the bottom-first replay split.
 			while (viewport.length < height) viewport.unshift("");
@@ -2521,6 +2616,7 @@ export class TUI extends Container {
 		}
 		const mutableTop = newTop + replayViewportRows;
 		const mutablePrepared = replayViewportRows > 0 ? prepared.slice(replayViewportRows) : prepared;
+		const providerScreenTop = newTop + providerViewportInset;
 		const marker = markers[0];
 		const target =
 			marker !== undefined && rows > 0
@@ -2552,6 +2648,7 @@ export class TUI extends Container {
 		else this.#recordHardwareCursorHidden();
 		this.#providerWindow = mutablePrepared;
 		this.#providerViewportTop = mutableTop;
+		provider?.onFrameEmitted?.(providerScreenTop);
 		this.#previousWidth = width;
 		this.#previousHeight = height;
 		this.#resizeBurstGrew = false;
@@ -2586,9 +2683,6 @@ export class TUI extends Container {
 			return;
 		}
 
-		// Fullscreen alt-screen short-circuit. While the topmost visible overlay
-		// requests it, borrow the terminal's alternate buffer and paint only the
-		// modal there; the normal screen and all accounting stay untouched.
 		const topOverlay = this.#getTopmostVisibleOverlay();
 		const wantAlt = topOverlay?.options?.fullscreen === true;
 		const wantMouseTracking = wantAlt && topOverlay.options?.mouseTracking !== false;
@@ -2597,7 +2691,11 @@ export class TUI extends Container {
 			// modified-key reporting sequence on the freshly entered alternate
 			// screen, or Esc/modified keys revert to legacy encoding inside
 			// fullscreen overlays (Ghostty/kitty/iTerm2).
-			const mouseEnter = wantMouseTracking ? MOUSE_TRACKING_ON : "";
+			const mouseEnter = wantMouseTracking
+				? MOUSE_TRACKING_ON
+				: this.#normalMouseTrackingActive
+					? NORMAL_MOUSE_TRACKING_OFF
+					: "";
 			this.terminal.write(`\x1b[?1049h${this.#keyboardEnhancementEnter()}${mouseEnter}`);
 			setAltScreenActive(true);
 			this.terminal.hideCursor();
@@ -2609,12 +2707,11 @@ export class TUI extends Container {
 			this.#altEnterWidth = width;
 			this.#altEnterHeight = height;
 		} else if (!wantAlt && this.#altActive) {
+			const normalMouse = this.#mouseTracking ? NORMAL_MOUSE_TRACKING_ON : "";
 			const mouseExit = this.#altMouseTrackingActive ? MOUSE_TRACKING_OFF : "";
 			const enhancementExit = this.#keyboardEnhancementExit();
-			const exitSequence = `${mouseExit}${enhancementExit}\x1b[?1049l`;
-			// Session replacement finishes while its fullscreen selector still
-			// covers the old normal buffer. Fuse the restore into the destructive
-			// repaint so no stale frame can become visible between writes.
+			const exitSequence = `${mouseExit}${enhancementExit}\x1b[?1049l${normalMouse}`;
+			this.#normalMouseTrackingActive = this.#mouseTracking;
 			if (this.#clearScrollbackOnNextRender) {
 				this.#pendingAltExit = exitSequence;
 			} else {

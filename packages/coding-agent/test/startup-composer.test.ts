@@ -3,6 +3,9 @@ import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getDefault } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import { COMPOSER_DEFAULTS, Composer, type ComposerPreferences } from "@oh-my-pi/pi-coding-agent/modes/composer";
+import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
+import { Text } from "@oh-my-pi/pi-tui";
+import { setKittyProtocolActive } from "@oh-my-pi/pi-tui/keys";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import {
 	applyStartupComposerPreferences,
@@ -69,6 +72,7 @@ describe("Composer prepaint", () => {
 			maxInlineImages: settings.get("tui.maxInlineImages"),
 			resizeScrollback: settings.get("tui.resizeScrollback"),
 			imeSafeCursor: settings.get("tui.imeSafeCursor"),
+			mouse: settings.get("tui.mouse"),
 			autocompleteMaxVisible: settings.get("autocompleteMaxVisible"),
 			spellingTypoDetection: settings.get("spelling.typoDetection"),
 			spellingAutocomplete: settings.get("spelling.autocomplete"),
@@ -79,6 +83,7 @@ describe("Composer prepaint", () => {
 	afterEach(() => {
 		stopPendingStartupComposer();
 		resetSettingsForTest();
+		setKittyProtocolActive(false);
 	});
 
 	it("keeps one live editor and terminal across handoff", () => {
@@ -403,6 +408,7 @@ describe("Composer prepaint", () => {
 			maxInlineImages: getDefault("tui.maxInlineImages"),
 			resizeScrollback: getDefault("tui.resizeScrollback"),
 			imeSafeCursor: getDefault("tui.imeSafeCursor"),
+			mouse: getDefault("tui.mouse"),
 			autocompleteMaxVisible: getDefault("autocompleteMaxVisible"),
 			spellingTypoDetection: getDefault("spelling.typoDetection"),
 			spellingAutocomplete: getDefault("spelling.autocomplete"),
@@ -646,5 +652,215 @@ describe("Composer prepaint", () => {
 		lease?.adopt();
 		expect(terminal.inputEnables).toBe(1);
 		lease?.composer.ui.stop();
+	});
+
+	it("positions cursor when clicking in the composer prompt entry box", async () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const composer = new Composer({
+			preferences: { ...config, composerShape: "box" },
+			terminal,
+		});
+		composer.editor.setText("Hello world prompt");
+		composer.start();
+
+		await terminal.waitForRender(() =>
+			terminal.getViewport().some(row => Bun.stripANSI(row).includes("Hello world prompt")),
+		);
+
+		composer.ui.resetDisplay();
+		await terminal.waitForRender(() =>
+			terminal.getViewport().some(row => Bun.stripANSI(row).includes("Hello world prompt")),
+		);
+
+		const textRow = terminal.getViewport().findIndex(row => Bun.stripANSI(row).includes("Hello world prompt"));
+		expect(textRow).toBeGreaterThanOrEqual(0);
+		const row1Based = textRow + 1;
+
+		terminal.sendInput(`\x1b[<0;10;${row1Based}M`);
+		expect(composer.editor.getCursor()).toEqual({ line: 0, col: 6 });
+
+		terminal.sendInput(`\x1b[<0;1;${row1Based}M`);
+		expect(composer.editor.getCursor()).toEqual({ line: 0, col: 0 });
+
+		terminal.sendInput(`\x1b[<0;50;${row1Based}M`);
+		expect(composer.editor.getCursor()).toEqual({ line: 0, col: 18 });
+		composer.stop();
+	});
+
+	it("scrolls transcript on wheel while mouse tracking is enabled", async () => {
+		const terminal = new VirtualTerminal(40, 8);
+		const composer = new Composer({
+			preferences: { ...config, quiet: true, composerShape: "box" },
+			terminal,
+		});
+		const transcript = new TranscriptContainer();
+		for (let index = 0; index < 12; index++) {
+			transcript.addChild(new Text(`history ${index}`, 0, 0));
+		}
+		composer.setRuntimeChildren([transcript, composer.editor]);
+		composer.start({ playWelcomeIntro: false });
+
+		for (let index = 0; index < 3; index++) {
+			await terminal.waitForRender();
+		}
+		const initialViewport = terminal.getViewport().join("\n");
+		expect(initialViewport).toContain("history 11");
+		expect(initialViewport).not.toContain("history 0");
+
+		for (let index = 0; index < 8; index++) {
+			terminal.sendInput("\x1b[<64;1;1M");
+		}
+		await terminal.waitForRender();
+		expect(terminal.getViewport().join("\n")).toContain("history 0");
+
+		terminal.sendInput("\x1b[6;16;8t");
+		await terminal.waitForRender();
+		expect(terminal.getViewport().join("\n")).toContain("history 0");
+
+		setKittyProtocolActive(true);
+		terminal.sendInput("\x1b[97;1:3u");
+		expect(terminal.getViewport().join("\n")).toContain("history 0");
+
+		const frozenViewport = terminal.getViewport();
+		transcript.addChild(new Text("streamed after scroll", 0, 0));
+		composer.ui.requestRender();
+		await terminal.waitForRender();
+		expect(terminal.getViewport()).toEqual(frozenViewport);
+
+		for (let index = 0; index < 8; index++) {
+			terminal.sendInput("\x1b[<65;1;1M");
+		}
+		await terminal.waitForRender(() =>
+			terminal.getViewport().some(row => Bun.stripANSI(row).includes("streamed after scroll")),
+		);
+
+		for (let index = 0; index < 8; index++) {
+			terminal.sendInput("\x1b[<64;1;1M");
+		}
+		await terminal.waitForRender(() => terminal.getViewport().some(row => Bun.stripANSI(row).includes("history 0")));
+
+		composer.setEditor(composer.editor);
+		composer.ui.requestRender();
+		await terminal.waitForRender(() =>
+			terminal.getViewport().some(row => Bun.stripANSI(row).includes("streamed after scroll")),
+		);
+		expect(terminal.getViewport().join("\n")).not.toContain("history 0");
+
+		terminal.sendInput("x");
+		await terminal.waitForRender(() => terminal.getViewport().some(row => row.includes("x")));
+		composer.stop();
+	});
+
+	it("positions the caret on the first click into a partially visible scrolled editor", async () => {
+		const terminal = new VirtualTerminal(40, 10);
+		const composer = new Composer({
+			preferences: { ...config, quiet: true, composerShape: "box" },
+			terminal,
+		});
+		const transcript = new TranscriptContainer();
+		for (let index = 0; index < 12; index++) {
+			transcript.addChild(new Text(`history ${index}`, 0, 0));
+		}
+		composer.editor.setText("line 0\nline 1\nline 2\nline 3\nline 4");
+		composer.setRuntimeChildren([transcript, composer.editor]);
+		composer.start({ playWelcomeIntro: false });
+
+		for (let index = 0; index < 3; index++) {
+			await terminal.waitForRender();
+		}
+		terminal.sendInput("\x1b[<64;1;1M");
+		await terminal.waitForRender();
+		const textRow = terminal.getViewport().findIndex(row => Bun.stripANSI(row).includes("line 0"));
+		expect(textRow).toBeGreaterThanOrEqual(0);
+
+		terminal.sendInput(`\x1b[<0;6;${textRow + 1}M`);
+		expect(composer.editor.getCursor()).toEqual({ line: 0, col: 2 });
+		await terminal.waitForRender(() => terminal.getViewport().some(row => Bun.stripANSI(row).includes("line 4")));
+		composer.stop();
+	});
+
+	it("ignores transcript clicks while the scrolled editor is fully hidden", async () => {
+		const terminal = new VirtualTerminal(40, 8);
+		const composer = new Composer({
+			preferences: { ...config, quiet: true, composerShape: "box" },
+			terminal,
+		});
+		const transcript = new TranscriptContainer();
+		for (let index = 0; index < 12; index++) {
+			transcript.addChild(new Text(`history ${index}`, 0, 0));
+		}
+		composer.editor.setText("draft 0\ndraft 1\ndraft 2\ndraft 3\ndraft 4\ndraft 5");
+		composer.setRuntimeChildren([transcript, composer.editor]);
+		composer.start({ playWelcomeIntro: false });
+
+		for (let index = 0; index < 3; index++) {
+			await terminal.waitForRender();
+		}
+		for (let index = 0; index < 8; index++) {
+			terminal.sendInput("\x1b[<64;1;1M");
+		}
+		await terminal.waitForRender(() => terminal.getViewport().some(row => Bun.stripANSI(row).includes("history 0")));
+
+		expect(composer.editor.getRenderedScreenRow()).toBeNull();
+		const cursor = composer.editor.getCursor();
+		const staleCursorRow = composer.ui.hardwareCursorRow;
+		const transcriptRow = staleCursorRow - 5;
+		expect(transcriptRow).toBeGreaterThanOrEqual(0);
+		expect(Bun.stripANSI(terminal.getViewport()[transcriptRow] ?? "")).toContain("history");
+
+		terminal.sendInput(`\x1b[<0;4;${transcriptRow + 1}M`);
+		expect(composer.editor.getCursor()).toEqual(cursor);
+		composer.stop();
+	});
+
+	it("flushes finalized transcript rows when stopped from a scrolled viewport", async () => {
+		const terminal = new VirtualTerminal(40, 8);
+		const composer = new Composer({
+			preferences: { ...config, quiet: true, composerShape: "box" },
+			terminal,
+		});
+		const transcript = new TranscriptContainer();
+		for (let index = 0; index < 12; index++) {
+			transcript.addChild(new Text(`history ${index}`, 0, 0));
+		}
+		composer.setRuntimeChildren([transcript, composer.editor]);
+		composer.start({ playWelcomeIntro: false });
+
+		for (let index = 0; index < 3; index++) {
+			await terminal.waitForRender();
+		}
+		for (let index = 0; index < 8; index++) {
+			terminal.sendInput("\x1b[<64;1;1M");
+		}
+		await terminal.waitForRender(() => terminal.getViewport().some(row => Bun.stripANSI(row).includes("history 0")));
+
+		transcript.addChild(new Text("late finalized", 0, 0));
+		composer.ui.requestRender();
+		await terminal.waitForRender();
+		expect(terminal.getScrollBuffer().join("\n")).not.toContain("late finalized");
+
+		composer.stop();
+		expect(terminal.getScrollBuffer().join("\n")).toContain("late finalized");
+	});
+
+	it("preserves signed editor origin when the editor top is clipped above the viewport", async () => {
+		const terminal = new VirtualTerminal(80, 8);
+		const composer = new Composer({
+			preferences: { ...config, composerShape: "box" },
+			terminal,
+		});
+		// Set multi-line text: top border + 6 lines of text + bottom border = 8 rows total
+		// Plus header rows (2) -> total composed rows (10) > terminal rows (8)
+		composer.editor.setText("line 0\nline 1\nline 2\nline 3\nline 4\nline 5");
+		composer.start();
+
+		await terminal.waitForRender(() => terminal.getViewport().some(row => Bun.stripANSI(row).includes("line 5")));
+
+		const renderedScreenRow = composer.editor.getRenderedScreenRow();
+		expect(renderedScreenRow).toBeDefined();
+		// Viewport shows bottom 8 rows; top of editor is pushed above the viewport (negative or 0)
+		expect(typeof renderedScreenRow).toBe("number");
+
+		composer.stop();
 	});
 });

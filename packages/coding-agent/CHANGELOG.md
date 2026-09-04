@@ -81,7 +81,7 @@
 - Added agent-scoped rules using an agents frontmatter field with glob matching, including support for inspecting applicable rules with omp ttsr list and omp ttsr test --agent.
 - Added non-interrupting extension messages through deliverAs: "aside" for pi.sendMessage and pi.sendUserMessage.
 - Added copy and open controls for rendered blocks and links, including /copy link and the /open command.
-- Added option-click cursor positioning in the prompt entry box.
+- Added click cursor positioning in the prompt entry box.
 - Added the configurable opencode display layout, with a corresponding first-run and upgrade setup option.
 - Added the skillful prompt setting and /skillful command to control whether available skills are listed in the system prompt.
 - Added Firecrawl as an optional providers.fetch backend for URL reading, configurable with FIRECRAWL_API_KEY and FIRECRAWL_BASE_URL.
@@ -150,6 +150,9 @@
 ### Removed
 
 - Removed the bundled `designer` subagent and `designer` model role; `modelRoles.designer` and `@designer` are no longer built in.
+### Added
+
+- Clicking in the prompt entry box now moves the cursor directly to the clicked location.
 
 ## [18.1.3] - 2026-09-02
 

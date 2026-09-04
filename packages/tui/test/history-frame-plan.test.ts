@@ -13,6 +13,7 @@ class Provider implements TerminalFrameProvider {
 	plan: TerminalFramePlan;
 	resizeRows: readonly string[] | undefined;
 	acknowledged: number[] = [];
+	frameTops: number[] = [];
 
 	constructor(plan: TerminalFramePlan) {
 		this.plan = plan;
@@ -28,6 +29,10 @@ class Provider implements TerminalFrameProvider {
 	acknowledgeHistory(id: number): void {
 		this.acknowledged.push(id);
 		this.plan = { viewport: this.plan.viewport };
+	}
+
+	onFrameEmitted(viewportTop: number): void {
+		this.frameTops.push(viewportTop);
 	}
 }
 
@@ -259,6 +264,23 @@ describe("terminal frame plans", () => {
 			"live",
 			"editor",
 		]);
+		tui.stop();
+	});
+
+	it("reports the original provider origin after replay uses leading blank rows", () => {
+		const terminal = new CountingTerminal(20, 5);
+		const provider = new Provider({ viewport: ["", "editor"] });
+		const tui = new TUI(terminal, undefined, { renderScheduler: scheduler });
+		tui.setFrameProvider(provider);
+		provider.frameTops.length = 0;
+
+		provider.plan = {
+			history: { id: 1, rows: ["history"], kind: "replay" },
+			viewport: ["", "editor"],
+		};
+		tui.requestRender(true);
+
+		expect(provider.frameTops.at(-1)).toBe(3);
 		tui.stop();
 	});
 

@@ -329,24 +329,13 @@ const KITTY_NUMPAD_TEXT: Record<number, string> = {
 	57409: ".",
 };
 
-/**
- * Check if the input is a key release event.
- * Only meaningful when Kitty keyboard protocol with flag 2 is active.
- * Returns false if Kitty protocol is not active.
- */
-export function isKeyRelease(data: string): boolean {
-	// Only detect release events when Kitty protocol is active
-	if (!kittyProtocolActive) {
-		return false;
-	}
-
-	// Don't treat bracketed paste content as key release
-	if (data.includes("\x1b[200~")) {
-		return false;
-	}
-
-	// Match the full CSI sequence pattern for release events
+export function isKeyReleaseSequence(data: string): boolean {
+	if (data.includes("\x1b[200~")) return false;
 	return KITTY_RELEASE_PATTERN.test(data);
+}
+
+export function isKeyRelease(data: string): boolean {
+	return kittyProtocolActive && isKeyReleaseSequence(data);
 }
 
 /**

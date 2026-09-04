@@ -92,6 +92,23 @@ const PINNED_FRONTIER_WARN_MS = 30_000;
 const EMPTY_ROWS: readonly string[] = [];
 const EMPTY_STABLE_ROWS: readonly TranscriptStableRow[] = [];
 
+export interface TranscriptScrollCursor {
+	readonly entryIndex: number;
+	readonly rowEnd: number;
+	readonly separatorAfter: boolean;
+}
+
+export interface TranscriptScrollSnapshot {
+	readonly width: number;
+	readonly entries: readonly Component[];
+	readonly rendered: Map<Component, readonly string[]>;
+}
+
+export interface TranscriptScrollPage {
+	readonly rows: readonly string[];
+	readonly cursor?: TranscriptScrollCursor;
+}
+
 function isFinalized(component: Component): boolean {
 	const block = component as Component & FinalizableBlock;
 	return block.isTranscriptBlockFinalized?.() ?? true;
@@ -526,6 +543,81 @@ export class TranscriptContainer extends Container {
 			if (rows.length >= cap) break;
 		}
 		return rows.length > cap ? rows.slice(rows.length - cap) : rows;
+	}
+
+	createScrollSnapshot(width: number): TranscriptScrollSnapshot {
+		this.#syncEntries();
+		const snapshot: TranscriptScrollSnapshot = {
+			width: Math.max(1, Math.trunc(width)),
+			entries: this.#entries.map(entry => entry.component),
+			rendered: new Map(),
+		};
+		for (let index = 0; index < this.#entries.length; index++) {
+			if (this.#entries[index]!.state !== "committed") this.#scrollSnapshotRows(snapshot, index);
+		}
+		return snapshot;
+	}
+
+	renderScrollPage(
+		snapshot: TranscriptScrollSnapshot,
+		cursor: TranscriptScrollCursor | undefined,
+		maxRows: number,
+	): TranscriptScrollPage {
+		const rows: string[] = [];
+		let remaining = Math.max(0, Math.trunc(maxRows));
+		if (remaining === 0) return { rows, cursor };
+		let entryIndex = cursor?.entryIndex ?? snapshot.entries.length - 1;
+		let rowEnd = cursor?.rowEnd;
+		let separatorAfter = cursor?.separatorAfter ?? false;
+		while (entryIndex >= 0) {
+			const block = this.#scrollSnapshotRows(snapshot, entryIndex);
+			const end = Math.min(rowEnd ?? block.length, block.length);
+			if (end === 0) {
+				entryIndex--;
+				rowEnd = undefined;
+				continue;
+			}
+			if (separatorAfter) {
+				rows.unshift("");
+				remaining--;
+				separatorAfter = false;
+				if (remaining === 0) {
+					return { rows, cursor: { entryIndex, rowEnd: end, separatorAfter } };
+				}
+			}
+			const start = Math.max(0, end - remaining);
+			rows.unshift(...block.slice(start, end));
+			remaining -= end - start;
+			if (start > 0) {
+				return { rows, cursor: { entryIndex, rowEnd: start, separatorAfter: false } };
+			}
+			let previousIndex = entryIndex - 1;
+			let previousRows: readonly string[] = EMPTY_ROWS;
+			while (previousIndex >= 0) {
+				previousRows = this.#scrollSnapshotRows(snapshot, previousIndex);
+				if (previousRows.length > 0) break;
+				previousIndex--;
+			}
+			if (previousIndex < 0) return { rows };
+			entryIndex = previousIndex;
+			rowEnd = previousRows.length;
+			separatorAfter = true;
+			if (remaining === 0) {
+				return { rows, cursor: { entryIndex, rowEnd, separatorAfter } };
+			}
+		}
+		return { rows };
+	}
+
+	#scrollSnapshotRows(snapshot: TranscriptScrollSnapshot, entryIndex: number): readonly string[] {
+		const component = snapshot.entries[entryIndex];
+		if (component === undefined) return EMPTY_ROWS;
+		const cached = snapshot.rendered.get(component);
+		if (cached !== undefined) return cached;
+		this.#setAllocation(component, Number.MAX_SAFE_INTEGER, this.#lastFrame);
+		const rendered = trimBlankEdges(component.render(snapshot.width));
+		snapshot.rendered.set(component, rendered);
+		return rendered;
 	}
 
 	/** Full semantic render used by exports and non-terminal commands. */

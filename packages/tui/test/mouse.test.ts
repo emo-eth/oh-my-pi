@@ -1,4 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+import { TUI } from "@oh-my-pi/pi-tui";
+import { setKittyProtocolActive } from "@oh-my-pi/pi-tui/keys";
 import {
 	parseSgrMouse,
 	routeSelectListMouse,
@@ -6,6 +8,9 @@ import {
 	type SelectListMouseTarget,
 	type SgrMouseEvent,
 } from "@oh-my-pi/pi-tui/mouse";
+import { VirtualTerminal } from "./virtual-terminal";
+
+afterEach(() => setKittyProtocolActive(false));
 
 describe("parseSgrMouse", () => {
 	it("returns null for non-mouse input", () => {
@@ -24,6 +29,9 @@ describe("parseSgrMouse", () => {
 			wheel: null,
 			motion: false,
 			leftClick: true,
+			shift: false,
+			alt: false,
+			ctrl: false,
 		});
 	});
 
@@ -44,6 +52,23 @@ describe("parseSgrMouse", () => {
 		expect(event?.motion).toBe(true);
 		expect(event?.leftClick).toBe(false);
 		expect(event?.wheel).toBeNull();
+	});
+
+	it("decodes modifier keys in button code", () => {
+		const altClick = parseSgrMouse("\x1b[<8;5;9M");
+		expect(altClick?.alt).toBe(true);
+		expect(altClick?.shift).toBe(false);
+		expect(altClick?.ctrl).toBe(false);
+		expect(altClick?.leftClick).toBe(true);
+
+		const shiftClick = parseSgrMouse("\x1b[<4;5;9M");
+		expect(shiftClick?.shift).toBe(true);
+		expect(shiftClick?.alt).toBe(false);
+
+		const ctrlAltClick = parseSgrMouse("\x1b[<24;5;9M");
+		expect(ctrlAltClick?.ctrl).toBe(true);
+		expect(ctrlAltClick?.alt).toBe(true);
+		expect(ctrlAltClick?.shift).toBe(false);
 	});
 });
 
@@ -128,5 +153,207 @@ describe("routeSelectListMouse", () => {
 		const handled = routeSelectListMouse(target, { ...baseEvent, release: true }, 0);
 		expect(handled).toBe(false);
 		expect(calls).toEqual([]);
+	});
+});
+
+describe("TUI mouse tracking lifecycle", () => {
+	class RecordingTerminal extends VirtualTerminal {
+		writes: string[] = [];
+		override write(data: string): void {
+			this.writes.push(data);
+			super.write(data);
+		}
+	}
+
+	it("defaults normal-mode mouse reporting to disabled", () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TUI(terminal, false);
+
+		tui.start();
+		expect(terminal.writes.join("")).not.toContain("\x1b[?1000h");
+		expect(terminal.writes.join("")).not.toContain("\x1b[?1006h");
+		tui.stop();
+	});
+
+	it("delays normal-mode mouse reporting until enableInput when input is deferred", () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TUI(terminal, false, { mouseTracking: true });
+		tui.start({ deferInput: true });
+		const startWrites = terminal.writes.join("");
+		expect(startWrites).not.toContain("\x1b[?1000h");
+		expect(startWrites).not.toContain("\x1b[?1006h");
+
+		tui.enableInput();
+		const afterEnable = terminal.writes.join("");
+		expect(afterEnable).toContain("\x1b[?1000h");
+		expect(afterEnable).toContain("\x1b[?1006h");
+
+		tui.stop();
+		const afterStop = terminal.writes.join("");
+		expect(afterStop).toContain("\x1b[?1000l");
+		expect(afterStop).toContain("\x1b[?1006l");
+	});
+
+	it("keeps explicit fullscreen tracking independent from disabled normal mode", async () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TUI(terminal, false, { mouseTracking: false });
+
+		tui.start();
+		expect(terminal.writes.join("")).not.toContain("\x1b[?1000h");
+
+		const overlay = {
+			render: () => ["modal line"],
+		};
+		tui.showOverlay(overlay, { fullscreen: true, mouseTracking: true });
+		terminal.writes.length = 0;
+		await terminal.waitForRender(() => terminal.writes.some(w => w.includes("\x1b[?1049h")));
+
+		const modalWrites = terminal.writes.join("");
+		expect(modalWrites).toContain("\x1b[?1049h");
+		expect(modalWrites).toContain("\x1b[?1000h");
+		expect(modalWrites).toContain("\x1b[?1003h");
+		expect(modalWrites).toContain("\x1b[?1006h");
+
+		terminal.writes.length = 0;
+		tui.setMouseTracking(true);
+		tui.setMouseTracking(false);
+		const toggledWrites = terminal.writes.join("");
+		expect(toggledWrites).not.toContain("\x1b[?1000l");
+		expect(toggledWrites).not.toContain("\x1b[?1003l");
+		expect(toggledWrites).not.toContain("\x1b[?1006l");
+
+		tui.stop();
+	});
+
+	it("honors explicit mouseTracking: false in fullscreen overlays", async () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TUI(terminal, false);
+		tui.start();
+
+		tui.showOverlay({ render: () => ["modal line"] }, { fullscreen: true, mouseTracking: false });
+		terminal.writes.length = 0;
+		await terminal.waitForRender(() => terminal.writes.some(write => write.includes("\x1b[?1049h")));
+
+		const modalWrites = terminal.writes.join("");
+		expect(modalWrites).not.toContain("\x1b[?1000h");
+		expect(modalWrites).not.toContain("\x1b[?1003h");
+		expect(modalWrites).not.toContain("\x1b[?1006h");
+		tui.stop();
+	});
+
+	it("lets listeners rewrite wheel input before consumed hotkeys reset the viewport", () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TUI(terminal, false, { mouseTracking: true });
+		let scrolled = false;
+		let resets = 0;
+		let rewriteWheel = true;
+		const received: string[] = [];
+		const focused = {
+			render: () => [""],
+			handleInput: (data: string) => received.push(data),
+		};
+		tui.setFrameProvider({
+			renderFrame: () => ({ viewport: [""] }),
+			acknowledgeHistory: () => {},
+			scrollViewport: () => {
+				scrolled = true;
+				return true;
+			},
+			resetViewport: () => {
+				if (!scrolled) return false;
+				scrolled = false;
+				resets++;
+				return true;
+			},
+		});
+		tui.addInputListener(data => {
+			if (rewriteWheel && data.startsWith("\x1b[<")) return { data: "a" };
+			return data === "\x0f" ? { consume: true } : undefined;
+		});
+		tui.addInputListener(data => (data === "a" ? { consume: true } : undefined));
+		tui.addChild(focused);
+		tui.setFocus(focused);
+		tui.start();
+		terminal.sendInput("\x1b[<64;1;1M");
+		expect(scrolled).toBeFalse();
+		expect(received).toEqual([]);
+		rewriteWheel = false;
+
+		terminal.sendInput("\x1b[<64;1;1M");
+		expect(scrolled).toBeTrue();
+		rewriteWheel = true;
+		terminal.sendInput("\x1b[<64;1;1M");
+		expect(scrolled).toBeFalse();
+		expect(resets).toBe(1);
+
+		rewriteWheel = false;
+		terminal.sendInput("\x1b[<64;1;1M");
+		expect(scrolled).toBeTrue();
+		tui.setMouseTracking(false);
+		expect(scrolled).toBeFalse();
+		expect(resets).toBe(2);
+
+		tui.setMouseTracking(true);
+		terminal.sendInput("\x1b[<64;1;1M");
+		expect(scrolled).toBeTrue();
+		terminal.sendInput("\x0f");
+		expect(scrolled).toBeFalse();
+		expect(resets).toBe(3);
+		tui.stop();
+	});
+
+	it("forwards opted-in key releases without resetting a scrolled provider", () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TUI(terminal, false, { mouseTracking: true });
+		let scrolled = false;
+		let resets = 0;
+		let rewriteRelease = false;
+		const received: string[] = [];
+		const focused = {
+			wantsKeyRelease: true,
+			render: () => [""],
+			handleInput: (data: string) => received.push(data),
+		};
+		tui.setFrameProvider({
+			renderFrame: () => ({ viewport: [""] }),
+			acknowledgeHistory: () => {},
+			scrollViewport: () => {
+				scrolled = true;
+				return true;
+			},
+			resetViewport: () => {
+				scrolled = false;
+				resets++;
+				return true;
+			},
+		});
+		tui.addInputListener(data => {
+			received.push(`listener:${data}`);
+			return rewriteRelease ? { data: "a" } : undefined;
+		});
+		tui.addChild(focused);
+		tui.setFocus(focused);
+		tui.start();
+
+		terminal.sendInput("\x1b[<64;1;1M");
+		terminal.sendInput("\x1b[97;1:3u");
+		expect(scrolled).toBeTrue();
+		expect(resets).toBe(0);
+		expect(received).toEqual(["listener:\x1b[<64;1;1M", "listener:\x1b[97;1:3u", "\x1b[97;1:3u"]);
+
+		received.length = 0;
+		setKittyProtocolActive(true);
+		terminal.sendInput("\x1b[97;1:3u");
+		expect(scrolled).toBeTrue();
+		expect(resets).toBe(0);
+		expect(received).toEqual(["listener:\x1b[97;1:3u", "\x1b[97;1:3u"]);
+
+		received.length = 0;
+		rewriteRelease = true;
+		terminal.sendInput("\x1b[97;1:3u");
+		expect(scrolled).toBeFalse();
+		expect(resets).toBe(1);
+		expect(received).toEqual(["listener:\x1b[97;1:3u", "a"]);
+		tui.stop();
 	});
 });

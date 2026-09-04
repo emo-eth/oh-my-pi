@@ -2982,4 +2982,129 @@ describe("Editor component", () => {
 			}
 		});
 	});
+
+	describe("click cursor positioning", () => {
+		it("moves cursor to clicked column on plain click without emitting onChange", () => {
+			const editor = new Editor(defaultEditorTheme);
+			const onChange = vi.fn();
+			editor.setText("Hello world");
+			editor.onChange = onChange;
+			editor.render(80);
+			editor.setRenderedScreenRow(10);
+
+			editor.handleInput("\x1b[<0;10;12M");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 6 });
+			expect(onChange).not.toHaveBeenCalled();
+		});
+
+		it("moves cursor to correct line in multi-line text", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("First line\nSecond line\nThird line");
+			editor.render(80);
+			editor.setRenderedScreenRow(5);
+
+			editor.handleInput("\x1b[<0;11;8M");
+			expect(editor.getCursor()).toEqual({ line: 1, col: 7 });
+		});
+
+		it("moves cursor to end of line when clicking past the text", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("Short");
+			editor.render(80);
+			editor.setRenderedScreenRow(0);
+
+			editor.handleInput("\x1b[<0;50;2M");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 5 });
+		});
+
+		it("moves cursor to start of line when clicking on gutter or border", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("Hello");
+			editor.render(80);
+			editor.setRenderedScreenRow(0);
+
+			editor.moveToLineEnd();
+			expect(editor.getCursor().col).toBe(5);
+
+			editor.handleInput("\x1b[<0;1;2M");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
+		});
+
+		it("moves cursor on an unmodified left click", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("Hello world");
+			editor.render(80);
+			editor.setRenderedScreenRow(10);
+			editor.moveToLineStart();
+
+			editor.handleInput("\x1b[<0;10;12M");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 6 });
+		});
+
+		it("ignores release events without modifying text", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("Hello");
+			editor.render(80);
+			editor.setRenderedScreenRow(0);
+
+			editor.handleInput("\x1b[<0;10;2m");
+			expect(editor.getText()).toBe("Hello");
+		});
+
+		it("ignores clicks outside the editor text area", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("Hello");
+			editor.render(80);
+			editor.setRenderedScreenRow(10);
+
+			editor.handleInput("\x1b[<0;10;11M");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 5 });
+
+			editor.handleInput("\x1b[<0;10;3M");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 5 });
+		});
+
+		it("snaps to atomic token boundary when clicking inside token", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.atomicTokenPattern = /\[Image #\d+\]/g;
+			editor.setText("See [Image #1] here");
+			editor.render(80);
+			editor.setRenderedScreenRow(0);
+
+			editor.handleInput("\x1b[<0;10;2M");
+			expect(editor.getCursor().col).toBe(4);
+		});
+
+		it("supports routeMouse directly with frame-local coordinates", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("Hello world");
+			editor.render(80);
+
+			editor.routeMouse(
+				{
+					button: 0,
+					col: 9,
+					row: 1,
+					release: false,
+					wheel: null,
+					motion: false,
+					leftClick: true,
+					alt: false,
+				},
+				1,
+				9,
+			);
+			expect(editor.getCursor()).toEqual({ line: 0, col: 6 });
+		});
+
+		it("uses tui.hardwareCursorRow fallback when renderedScreenRow is not set", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("Hello world");
+			editor.render(80);
+
+			editor.tui = { hardwareCursorRow: 11 } as never;
+			editor.handleInput("\x1b[<0;10;12M");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 6 });
+		});
+	});
 });

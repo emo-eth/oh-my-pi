@@ -17,7 +17,12 @@ import {
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import { CustomEditor } from "./components/custom-editor";
-import { type AnimationFrame, TranscriptContainer } from "./components/transcript-container";
+import {
+	type AnimationFrame,
+	type TranscriptScrollCursor,
+	type TranscriptScrollSnapshot,
+	TranscriptContainer,
+} from "./components/transcript-container";
 import { type LspServerInfo, type RecentSession, WelcomeComponent } from "./components/welcome";
 import { getEditorTheme, initThemeSync, theme } from "./theme/theme";
 
@@ -35,6 +40,7 @@ export interface ComposerPreferences {
 	readonly spellingTypoDetection: boolean;
 	readonly spellingAutocomplete: boolean;
 	readonly spellingAutocorrect: boolean;
+	readonly mouse?: boolean;
 }
 
 /** Settings-schema-compatible defaults used when constructing a dependency-free composer. */
@@ -49,6 +55,7 @@ export const COMPOSER_DEFAULTS: ComposerPreferences = {
 	spellingTypoDetection: true,
 	spellingAutocomplete: true,
 	spellingAutocorrect: false,
+	mouse: true,
 };
 
 /** Welcome data that can be supplied initially or patched as startup resolves it. */
@@ -91,6 +98,36 @@ export interface ComposerOptions {
 	readonly status?: ComposerStatusSnapshot;
 	readonly exit?: (code: number) => void;
 	readonly now?: () => number;
+}
+
+interface ComposerScrollSnapshot {
+	readonly transcript: TranscriptContainer;
+	readonly source: TranscriptScrollSnapshot;
+	readonly viewportRows: number;
+	cursor?: TranscriptScrollCursor;
+	readonly leadingRows: readonly string[];
+	leadingAttached: boolean;
+	rows: string[];
+	viewportEnd: number;
+	editorStart?: number;
+	editorEnd?: number;
+}
+
+function containsComponent(root: Component, target: Component): boolean {
+	if (root === target) return true;
+	if (root instanceof Container) {
+		return root.children.some(child => containsComponent(child, target));
+	}
+	return false;
+}
+
+function offsetOfComponent(roots: readonly Component[], target: Component, width: number): number | undefined {
+	let offset = 0;
+	for (const root of roots) {
+		if (containsComponent(root, target)) return offset;
+		offset += root.render(width).length;
+	}
+	return undefined;
 }
 
 /** Controls the first terminal paint for a composer that does not already own the terminal. */
@@ -178,6 +215,8 @@ export class Composer implements TerminalFrameProvider {
 					  };
 		  }
 		| undefined;
+	#lastEditorViewportRow: number | undefined;
+	#mouseScrollSnapshot: ComposerScrollSnapshot | undefined;
 	#historyReplayRequested = false;
 	#headerReplayPending = false;
 	#historyFlush = false;
@@ -207,16 +246,13 @@ export class Composer implements TerminalFrameProvider {
 		this.#statusSnapshot = options.status;
 		this.#applyWelcomeUpdate(options.welcome ?? {});
 
-		this.ui = new TUI(
-			options.terminal ?? new ProcessTerminal(),
-			this.#preferences.showHardwareCursor,
-			options.tuiOptions,
-		);
-		this.ui.setFrameProvider(this);
-		this.ui.setMaxInlineImages(this.#preferences.maxInlineImages);
-		this.ui.setResizeScrollback(this.#preferences.resizeScrollback);
+		this.ui = new TUI(options.terminal ?? new ProcessTerminal(), this.#preferences.showHardwareCursor, {
+			...options.tuiOptions,
+			mouseTracking: this.#preferences.mouse !== false,
+		});
 
 		this.#editor = new CustomEditor(getEditorTheme());
+		this.#editor.tui = this.ui;
 		this.editor.disableSubmit = true;
 		this.editor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		this.editor.setImeSafeCursorLayout(this.#preferences.imeSafeCursor);
@@ -239,6 +275,10 @@ export class Composer implements TerminalFrameProvider {
 		this.editor.onExit = () => this.#requestExit(0);
 		this.editor.setShimmerRepaintHandler(() => this.ui.requestComponentRender(this.editor));
 
+		this.ui.setFrameProvider(this);
+		this.ui.setMaxInlineImages(this.#preferences.maxInlineImages);
+		this.ui.setResizeScrollback(this.#preferences.resizeScrollback);
+
 		if (!this.#preferences.quiet) this.#ensureWelcome();
 		this.#rebuildHeader();
 		this.ui.addChild(this.#header);
@@ -246,6 +286,94 @@ export class Composer implements TerminalFrameProvider {
 		this.ui.addChild(this.editor);
 		this.ui.addChild(this.#statusHost);
 		this.ui.setFocus(this.editor);
+	}
+
+	scrollViewport(delta: -1 | 1): boolean {
+		if (!this.#runtimeMounted) return false;
+		const rows = Math.max(0, this.ui.terminal.rows);
+		const width = Math.max(1, this.ui.terminal.columns);
+		if (delta > 0) {
+			const snapshot = this.#mouseScrollSnapshot;
+			if (!snapshot) return true;
+			const viewportEnd = Math.min(snapshot.rows.length, snapshot.viewportEnd + 3);
+			if (viewportEnd === snapshot.rows.length) {
+				this.#mouseScrollSnapshot = undefined;
+			} else {
+				snapshot.viewportEnd = viewportEnd;
+			}
+			return true;
+		}
+		let snapshot = this.#mouseScrollSnapshot;
+		if (!snapshot) {
+			snapshot = this.#createMouseScrollSnapshot(width, rows);
+			if (!snapshot) return true;
+			this.#mouseScrollSnapshot = snapshot;
+		}
+		let viewportEnd = snapshot.viewportEnd - 3;
+		while (snapshot.cursor !== undefined && viewportEnd - rows < rows) {
+			const added = this.#prependMouseScrollPage(snapshot, rows);
+			if (added === 0) break;
+			viewportEnd += added;
+		}
+		snapshot.viewportEnd = Math.max(Math.min(rows, snapshot.rows.length), viewportEnd);
+		return true;
+	}
+
+	resetViewport(): boolean {
+		if (!this.#mouseScrollSnapshot) return false;
+		this.#mouseScrollSnapshot = undefined;
+		return true;
+	}
+
+	#createMouseScrollSnapshot(width: number, rows: number): ComposerScrollSnapshot | undefined {
+		const roots = [...this.#runtimeChildren, this.#statusHost];
+		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
+		if (transcriptIndex < 0) return undefined;
+		const transcript = roots[transcriptIndex] as TranscriptContainer;
+		const afterRoots = roots.slice(transcriptIndex + 1);
+		const after = this.#renderRoots(afterRoots, width);
+		const leadingRows: string[] = [];
+		const header = this.#header.render(width);
+		leadingRows.push(...header);
+		if (header.length > 0) leadingRows.push("");
+		leadingRows.push(...this.#renderRoots(roots.slice(0, transcriptIndex), width));
+		const source = transcript.createScrollSnapshot(width);
+		const page = transcript.renderScrollPage(source, undefined, Math.max(1, rows * 2 + 3 - after.length));
+		const leadingAttached = page.cursor === undefined;
+		const prefix = leadingAttached ? leadingRows : [];
+		const snapshotRows = [...prefix, ...page.rows, ...after];
+		if (page.cursor === undefined && snapshotRows.length <= rows) return undefined;
+		const editorOffset = offsetOfComponent(afterRoots, this.editor, width);
+		const editorStart = editorOffset === undefined ? undefined : prefix.length + page.rows.length + editorOffset;
+		return {
+			transcript,
+			source,
+			viewportRows: rows,
+			cursor: page.cursor,
+			leadingRows,
+			leadingAttached,
+			rows: snapshotRows,
+			viewportEnd: snapshotRows.length,
+			editorStart,
+			editorEnd: editorStart === undefined ? undefined : editorStart + this.editor.render(width).length,
+		};
+	}
+
+	#prependMouseScrollPage(snapshot: ComposerScrollSnapshot, rows: number): number {
+		if (snapshot.cursor === undefined) return 0;
+		const page = snapshot.transcript.renderScrollPage(snapshot.source, snapshot.cursor, Math.max(1, rows));
+		snapshot.cursor = page.cursor;
+		const prefix = [...page.rows];
+		if (page.cursor === undefined && !snapshot.leadingAttached) {
+			prefix.unshift(...snapshot.leadingRows);
+			snapshot.leadingAttached = true;
+		}
+		if (prefix.length === 0) return 0;
+		snapshot.rows.unshift(...prefix);
+		snapshot.viewportEnd += prefix.length;
+		if (snapshot.editorStart !== undefined) snapshot.editorStart += prefix.length;
+		if (snapshot.editorEnd !== undefined) snapshot.editorEnd += prefix.length;
+		return prefix.length;
 	}
 	/** Compose the bounded mutable viewport and the next ordered history append. */
 	renderFrame(viewport: ViewportSize): TerminalFramePlan {
@@ -261,8 +389,48 @@ export class Composer implements TerminalFrameProvider {
 			? [...this.#runtimeChildren, this.#statusHost]
 			: [this.#header, this.#bootstrapInputGap, this.editor, this.#statusHost];
 		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
+		if (this.ui.clearScrollbackOnNextRender) this.#mouseScrollSnapshot = undefined;
+		const scrollSnapshot = this.#mouseScrollSnapshot;
+		if (
+			transcriptIndex >= 0 &&
+			scrollSnapshot &&
+			scrollSnapshot.transcript === roots[transcriptIndex] &&
+			scrollSnapshot.source.width === width &&
+			scrollSnapshot.viewportRows === rows
+		) {
+			const end = Math.min(scrollSnapshot.rows.length, scrollSnapshot.viewportEnd);
+			const start = Math.max(0, end - rows);
+			if (
+				scrollSnapshot.editorStart !== undefined &&
+				scrollSnapshot.editorEnd !== undefined &&
+				scrollSnapshot.editorStart < end &&
+				scrollSnapshot.editorEnd > start
+			) {
+				this.#lastEditorViewportRow = scrollSnapshot.editorStart - start;
+				this.editor.setRenderedScreenRow(this.#lastEditorViewportRow);
+			} else {
+				this.#lastEditorViewportRow = undefined;
+				this.editor.setRenderedScreenRow(null);
+			}
+			return { viewport: scrollSnapshot.rows.slice(start, end) };
+		}
+		if (scrollSnapshot) this.#mouseScrollSnapshot = undefined;
 		if (transcriptIndex < 0) {
-			return { viewport: this.#renderRoots(roots, width).slice(-rows) };
+			const rendered = this.#renderRoots(roots, width);
+			const editorOffset = offsetOfComponent(roots, this.editor, width);
+			if (editorOffset !== undefined) {
+				const vpOffset = Math.max(0, rendered.length - rows);
+				const editorVpRow = editorOffset - vpOffset;
+				this.#lastEditorViewportRow = editorVpRow;
+				const destructiveReset = this.ui.clearScrollbackOnNextRender;
+				const startTop = destructiveReset ? 0 : Math.min(this.ui.providerViewportTop, Math.max(0, rows - 1));
+				const newTop = Math.max(0, Math.min(startTop, rows - rendered.length));
+				this.editor.setRenderedScreenRow(newTop + editorVpRow);
+			} else {
+				this.#lastEditorViewportRow = undefined;
+				this.editor.setRenderedScreenRow(null);
+			}
+			return { viewport: rendered.slice(-rows) };
 		}
 		const transcript = roots[transcriptIndex] as TranscriptContainer;
 		const preRoots = this.#renderRoots(roots.slice(0, transcriptIndex), width);
@@ -282,6 +450,22 @@ export class Composer implements TerminalFrameProvider {
 		if (history !== undefined && this.#offeredHistory?.source === "header") {
 			const visibleHeaderRows = Math.max(0, rows - composed.length);
 			this.#retiredHeaderStart = Math.max(0, history.rows.length - visibleHeaderRows);
+		}
+		const offsetInAfter = offsetOfComponent(roots.slice(transcriptIndex + 1), this.editor, width);
+		if (offsetInAfter !== undefined) {
+			const editorRowInComposed = before.length + active.length + offsetInAfter;
+			const vpOffset = Math.max(0, composed.length - rows);
+			const editorVpRow = editorRowInComposed - vpOffset;
+			this.#lastEditorViewportRow = editorVpRow;
+			const destructiveReset = this.ui.clearScrollbackOnNextRender;
+			const startTop = destructiveReset ? 0 : Math.min(this.ui.providerViewportTop, Math.max(0, rows - 1));
+			const historyCount = history?.rows.length ?? 0;
+			const viewportLen = Math.min(rows, composed.length);
+			const newTop = Math.max(0, Math.min(startTop + historyCount, rows - viewportLen));
+			this.editor.setRenderedScreenRow(newTop + editorVpRow);
+		} else {
+			this.#lastEditorViewportRow = undefined;
+			this.editor.setRenderedScreenRow(null);
 		}
 		return {
 			history,
@@ -309,9 +493,19 @@ export class Composer implements TerminalFrameProvider {
 		if (this.#historyReplayRequested) this.#startHistoryReplay();
 	}
 
+	/** Sync the editor screen position once the frame has been physically emitted. */
+	onFrameEmitted(viewportTop: number): void {
+		if (this.#lastEditorViewportRow !== undefined) {
+			this.#editor?.setRenderedScreenRow(viewportTop + this.#lastEditorViewportRow);
+		} else {
+			this.#editor?.setRenderedScreenRow(null);
+		}
+	}
+
 	/** Render the semantic transcript tail while the terminal borrows its resize buffer. */
 	renderResizeFrame(viewport: ViewportSize): readonly string[] {
 		if (!this.#started || this.#stopped) return [];
+		this.#editor?.setRenderedScreenRow(null);
 		const width = Math.max(1, viewport.columns);
 		const rows = Math.max(0, viewport.rows);
 		const tail = this.#runtimeMounted
@@ -333,6 +527,7 @@ export class Composer implements TerminalFrameProvider {
 
 	/** Replays committed presentation without changing logical retirement state. */
 	beginHistoryReplay(): void {
+		this.#mouseScrollSnapshot = undefined;
 		if (this.#offeredHistory !== undefined) {
 			this.#historyReplayRequested = true;
 			return;
@@ -342,6 +537,7 @@ export class Composer implements TerminalFrameProvider {
 
 	/** Forces every currently eligible finalized prefix to retire before stop. */
 	beginHistoryFlush(): void {
+		this.#mouseScrollSnapshot = undefined;
 		this.#historyFlush = true;
 		// A pending replay would re-render and re-stream the entire committed
 		// ledger during shutdown; the terminal already holds that history, so
@@ -551,6 +747,7 @@ export class Composer implements TerminalFrameProvider {
 		this.ui.setShowHardwareCursor(this.#preferences.showHardwareCursor);
 		this.editor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		this.ui.setMaxInlineImages(this.#preferences.maxInlineImages);
+		if (update.mouse !== undefined) this.ui.setMouseTracking(update.mouse);
 		if (update.resizeScrollback !== undefined) this.ui.setResizeScrollback(update.resizeScrollback);
 		this.editor.setImeSafeCursorLayout(this.#preferences.imeSafeCursor);
 		this.editor.setAutocompleteMaxVisible(this.#preferences.autocompleteMaxVisible);
@@ -600,7 +797,9 @@ export class Composer implements TerminalFrameProvider {
 
 	/** Update the canonical editor reference after InteractiveMode remounts a custom editor. */
 	setEditor(editor: CustomEditor): void {
+		this.#mouseScrollSnapshot = undefined;
 		this.#editor = editor;
+		editor.tui = this.ui;
 	}
 
 	/**
@@ -645,6 +844,7 @@ export class Composer implements TerminalFrameProvider {
 	/** Mount or replace session-aware root children while preserving the header and status hosts. */
 	setRuntimeChildren(children: readonly Component[]): void {
 		if (this.#stopped) return;
+		this.#mouseScrollSnapshot = undefined;
 		this.ui.removeChild(this.#statusHost);
 		if (this.#runtimeMounted) {
 			for (const child of this.#runtimeChildren) this.ui.removeChild(child);
