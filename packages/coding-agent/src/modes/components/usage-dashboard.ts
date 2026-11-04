@@ -129,7 +129,7 @@ function aggregateRowStatus(windows: CardWindowRow[]): UsageLimit["status"] {
 /**
  * Collapse usage reports into one compact card per provider: limits grouped by
  * quota bucket (label + window), each bucket showing the mean used fraction
- * across accounts (matching the classic report's aggregate "% free") with the
+ * across accounts (matching the classic report's aggregate "% used") with the
  * most-used account's reset countdown. Cards sort most-pressing first so
  * what's burning is on top-left; fully idle providers collapse into a tick.
  */
@@ -399,8 +399,12 @@ export class UsageDashboardComponent implements Component {
 			(max, window) => Math.max(max, window.resetMs !== undefined ? formatDuration(window.resetMs).length : 0),
 			0,
 		);
+		const pctColWidth = 9; // e.g. "  72% used"
 		const labelWidth = Math.min(16, Math.max(6, width - 24));
-		const barWidth = Math.max(5, width - 2 - labelWidth - 1 - 5 - (resetWidth > 0 ? resetWidth + 1 : 0));
+		const barWidth = Math.max(
+			5,
+			width - 2 - labelWidth - 1 - pctColWidth - (resetWidth > 0 ? resetWidth + 1 : 0),
+		);
 		for (const window of visibleWindows) {
 			const tagPlain = window.windowTag
 				? truncateToWidth(window.windowTag, Math.max(2, Math.floor(labelWidth / 2) - 1))
@@ -415,8 +419,8 @@ export class UsageDashboardComponent implements Component {
 				lines.push(truncateToWidth(`  ${label} ${text}`, width));
 				continue;
 			}
-			const freePct = Math.max(0, Math.round((1 - window.fraction) * 100));
-			const pctText = theme.fg(this.#statusColor(window.status), `${freePct}%`.padStart(5));
+			const usedPct = Math.max(0, Math.round(window.fraction * 100));
+			const pctText = theme.fg(this.#statusColor(window.status), `${usedPct}% used`.padStart(pctColWidth));
 			const resetPlain = window.resetMs !== undefined ? formatDuration(window.resetMs) : "";
 			const resetText = resetWidth > 0 ? ` ${theme.fg("dim", resetPlain.padStart(resetWidth))}` : "";
 			lines.push(`  ${label} ${this.#miniBar(window.fraction, window.status, barWidth)}${pctText}${resetText}`);

@@ -1,7 +1,12 @@
-import { describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it } from "bun:test";
 import type { DailyActivityPoint } from "@oh-my-pi/omp-stats/shared-types";
 import type { UsageReport } from "@oh-my-pi/pi-ai";
-import { buildHeatmapLayout, buildProviderCards } from "@oh-my-pi/pi-coding-agent/modes/components/usage-dashboard";
+import {
+	buildHeatmapLayout,
+	buildProviderCards,
+	UsageDashboardComponent,
+} from "@oh-my-pi/pi-coding-agent/modes/components/usage-dashboard";
+import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
 function day(day: string, cost: number, requests = 1): DailyActivityPoint {
 	return { day, cost, requests, totalTokens: 0 };
@@ -78,7 +83,7 @@ describe("buildProviderCards", () => {
 
 	it("averages a window across accounts instead of showing the worst account", () => {
 		// One exhausted + one barely-used account: the classic report shows the
-		// aggregate (~50% free), so the card must not read 0% free.
+		// aggregate (~50% used), so the card must not read 100% used from the worst account alone.
 		const reports = [
 			report("anthropic", "a@x.test", [limit("anthropic", "a", "7d", "Claude 7 Day", 1.0, "exhausted", now + 1000)]),
 			report("anthropic", "b@x.test", [limit("anthropic", "b", "7d", "Claude 7 Day", 0.0, "ok", now + 99_000)]),
@@ -106,5 +111,34 @@ describe("buildProviderCards", () => {
 		expect(idle.sort()).toEqual(["cursor", "ollama-cloud"]);
 		const unlimited = cards.find(card => card.provider === "ollama-cloud");
 		expect(unlimited?.unlimited).toBe(true);
+	});
+});
+
+describe("UsageDashboardComponent", () => {
+	beforeAll(async () => {
+		await initTheme(false);
+	});
+
+	it("labels subscription grid percentages as used to match the classic /usage report", async () => {
+		const now = Date.now();
+		const reports = [
+			report("xai-oauth", "user@example.com", [
+				limit("xai-oauth", "a", "1w", "SuperGrok Weekly Credits", 0.72, "warning", now + 86_400_000),
+				limit("xai-oauth", "a", "1w", "GrokBot (Weekly)", 0.61, "warning", now + 86_400_000),
+			]),
+		];
+		const { promise: rendered, resolve: markRendered } = Promise.withResolvers<void>();
+		const component = new UsageDashboardComponent({
+			reports,
+			renderDetail: () => "",
+			loadActivity: async () => [],
+			requestRender: () => markRendered(),
+			onClose: () => {},
+		});
+		await rendered;
+		const plain = component.render(100).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+		expect(plain).toContain("72% used");
+		expect(plain).toContain("61% used");
+		expect(plain).not.toMatch(/\b28%\b/);
 	});
 });
